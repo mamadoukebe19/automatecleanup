@@ -1,0 +1,168 @@
+#  Copyright 2018 1Strategy, LLC
+
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+
+#        http://www.apache.org/licenses/LICENSE-2.0
+
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  This CFN Template creates a CodeBuild Project and associated resources for setting up a multi-account script that totally destroys resources within those accounts; via AWS-Nuke.
+
+Parameters:
+  ParentOuId:
+    Description: The unique ID of the Organizational Unit that owns all accounts that AWS-Nuke will destroy
+    Type: String
+  BucketName:
+    Description: The name of the bucket where the aws-nuke-config.yaml file is stored
+    Type: String
+  AssumeRoleName:
+    Description: The name of the Role to be assumed within each account, providing permissions to cleanse the account(s)
+    Type: String
+
+Resources:
+  CloudWatchNukeScriptScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub CloudWatchNukeScriptSchedule-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: events.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      
+      - PolicyName: CloudWatchNukeScriptSchedulePolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          
+          - Effect: Allow
+            Action: codebuild:StartBuild
+            Resource: !Sub arn:aws:codebuild:us-west-2:${AWS::AccountId}:project/AccountNuker-${AWS::StackName}
+
+  NukeScriptProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      
+      - PolicyName: NukeCodeBuildLogsPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - !Sub arn:aws:logs:us-west-2:${AWS::AccountId}:log-group:AccountNuker-${AWS::StackName}
+            - !Sub arn:aws:logs:us-west-2:${AWS::AccountId}:log-group:AccountNuker-${AWS::StackName}:*
+
+      - PolicyName: AssumeNukePolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !Sub arn:aws:iam::*:role/${AssumeRoleName}
+
+      - PolicyName: NukeListOUAccounts
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          
+          - Effect: Allow
+            Action: organizations:ListAccountsForParent
+            Resource: "*"
+
+  NukeScriptProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: NO_ARTIFACTS
+      BadgeEnabled: false
+      Description: Builds a container to run AWS-Nuke for all accounts within the specified OU
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/docker:18.09.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: true
+        Type: LINUX_CONTAINER
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Sub "AccountNuker-${AWS::StackName}"
+          Status: ENABLED
+      Name: !Sub "AccountNuker-${AWS::StackName}"
+      ServiceRole: !GetAtt NukeScriptProjectRole.Arn
+      Source:
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - apt-get install jq
+                - wget https://github.com/rebuy-de/aws-nuke/releases/download/v2.10.0/aws-nuke-v2.10.0-linux-amd64
+                - mv aws-nuke-v2.10.0-linux-amd64 /bin/aws-nuke
+                - chmod +x /bin/aws-nuke
+            build:
+              commands:
+                - ACCOUNT_LIST=$(aws organizations list-accounts-for-parent --parent-id ${ParentOuId} --output text | awk '{print $4}')
+                - aws s3 cp s3://${BucketName}/aws-nuke-config.yaml .
+                - |
+                  for account_id in $ACCOUNT_LIST
+                  do
+                    echo "Assuming Role for Account $account_id";
+                    aws sts assume-role --role-arn arn:aws:iam::$account_id:role/${AssumeRoleName} --role-session-name account-$account_id --query "Credentials" > $account_id.json;
+                    cat $account_id.json
+                    ACCESS_KEY_ID=$(cat $account_id.json |jq -r .AccessKeyId);
+                    SECRET_ACCESS_KEY=$(cat $account_id.json |jq -r .SecretAccessKey);
+                    SESSION_TOKEN=$(cat $account_id.json |jq -r .SessionToken);
+                    cp aws-nuke-config.yaml $account_id.yaml;
+                    sed -i -e "s/000000000000/$account_id/g" $account_id.yaml;
+                    echo "Configured aws-nuke-config.yaml";
+                    echo "Running Nuke on Account $account_id";
+                    # TODO: Add --no-dry-run flag for Production
+                    aws-nuke -c $account_id.yaml --force --access-key-id $ACCESS_KEY_ID --secret-access-key $SECRET_ACCESS_KEY --session-token $SESSION_TOKEN |tee -a aws-nuke.log;
+                    nuke_pid=$!;
+                    wait $nuke_pid;
+                  done
+                - echo "Completed Nuke Process for all accounts"
+            post_build:
+              commands:
+                - cat aws-nuke.log
+        Type: NO_SOURCE
+
+  CloudWatchNukeScriptSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub NukeScriptCloudWatchSchedule-${AWS::StackName}
+      Description: Scheduled Event for running AWS Nuke on all accounts within the specified OU
+      ScheduleExpression: cron(0 16 ? * 1-5 *)
+      State: ENABLED
+      RoleArn: !GetAtt CloudWatchNukeScriptScheduleRole.Arn
+      Targets:
+      
+      - Arn: !GetAtt NukeScriptProject.Arn
+        RoleArn: !GetAtt CloudWatchNukeScriptScheduleRole.Arn
+        Id: NukeScriptId
